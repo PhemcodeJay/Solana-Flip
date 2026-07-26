@@ -5,6 +5,8 @@ import { PairManager } from './pairs/priority';
 import { DexScanner } from './dex/scanner';
 import { JitoManager } from './jito/jito';
 import { TelegramAlert } from './alerts/telegram';
+import { DiscordNotifier } from './alerts/discord';
+import { WhatsAppNotifier } from './alerts/whatsapp';
 import { RiskManager } from './risk/manager';
 import { StateManager } from './state/manager';
 import { ArbOpportunity } from './dex/interfaces';
@@ -15,7 +17,9 @@ export class Bot {
   private scanner: DexScanner;
   private pairManager: PairManager;
   private jito: JitoManager;
-  private alerts: TelegramAlert;
+  private telegram: TelegramAlert;
+  private discord: DiscordNotifier;
+  private whatsapp: WhatsAppNotifier;
   private risk: RiskManager;
   private state: StateManager;
   private isRunning: boolean = false;
@@ -27,7 +31,9 @@ export class Bot {
     this.scanner = new DexScanner(this.wallet.getConnection());
     this.pairManager = new PairManager();
     this.jito = new JitoManager(this.wallet.getConnection());
-    this.alerts = new TelegramAlert();
+    this.telegram = new TelegramAlert();
+    this.discord = new DiscordNotifier();
+    this.whatsapp = new WhatsAppNotifier();
     this.risk = new RiskManager();
     this.state = new StateManager();
   }
@@ -46,7 +52,7 @@ export class Bot {
         console.error(`\n❌ Insufficient balance: ${balance} SOL`);
         console.error(`   Minimum required: ${CONFIG.capital.minStartBalance} SOL`);
         console.error(`   Please fund your wallet and try again.\n`);
-        await this.alerts.notifyError(`Insufficient balance: ${balance} SOL (min: ${CONFIG.capital.minStartBalance} SOL)`);
+        await this.sendAllAlerts(`Insufficient balance: ${balance} SOL (min: ${CONFIG.capital.minStartBalance} SOL)`, 'error');
         await this.stop();
         process.exit(1);
       }
@@ -54,7 +60,7 @@ export class Bot {
       console.log(`Minimum start balance met: ${CONFIG.capital.minStartBalance} SOL`);
       console.log('Bot started successfully');
       
-      await this.alerts.sendMessage(`🤖 <b>Solana Arbitrage Bot Started</b>\nBalance: ${balance.toFixed(4)} SOL\nMin Profit: ${CONFIG.arbitrage.minProfitPct}%`);
+      await this.sendAllAlerts(`Solana Arbitrage Bot Started\nBalance: ${balance.toFixed(4)} SOL`, 'success');
 
       // Start arbitrage scanning loop
       await this.scanLoop();
@@ -76,8 +82,8 @@ export class Bot {
         
         // Check stop loss before scanning
         if (balance <= CONFIG.capital.stopLossBalance) {
-          console.warn(`⚠️ Stop loss triggered: balance ${balance.toFixed(4)} SOL <= ${CONFIG.capital.stopLossBalance} SOL`);
-          await this.alerts.notifyError(`Stop loss triggered! Balance: ${balance.toFixed(4)} SOL`);
+          console.warn(`Stop loss triggered: balance ${balance.toFixed(4)} SOL <= ${CONFIG.capital.stopLossBalance} SOL`);
+          await this.sendAllAlerts(`Stop loss triggered! Balance: ${balance.toFixed(4)} SOL`, 'warning');
           await this.stop();
           break;
         }
@@ -85,7 +91,7 @@ export class Bot {
         // Check risk management
         const riskCheck = this.risk.canTrade(balance);
         if (!riskCheck.allowed) {
-          if (Math.random() < 0.1) { // Log occasionally
+          if (Math.random() < 0.1) {
             console.log(`Risk check: ${riskCheck.reason}`);
           }
           await this.delay(CONFIG.scanning.intervalMs);
@@ -104,6 +110,8 @@ export class Bot {
               console.log(`  #${i + 1}: ${opp.pair} | ${opp.buyDex} -> ${opp.sellDex} | Profit: ${opp.profitPct.toFixed(3)}%`);
             });
             lastOpportunityLog = Date.now();
+            
+            await this.sendAllAlerts(`Found ${opportunities.length} opportunities. Top: ${opportunities[0].pair} @ ${opportunities[0].profitPct.toFixed(3)}%`, 'info');
           }
 
           // Add to pair manager
@@ -119,8 +127,9 @@ export class Bot {
         await this.delay(CONFIG.scanning.intervalMs);
       } catch (error) {
         console.error('Error in scan loop:', error);
-        this.state.setError(`Scan error: ${error instanceof Error ? error.message : String(error)}`);
-        await this.alerts.notifyError(`Scan error: ${error instanceof Error ? error.message : String(error)}`);
+        const errMsg = error instanceof Error ? error.message : String(error);
+        this.state.setError(`Scan error: ${errMsg}`);
+        await this.sendAllAlerts(`Scan error: ${errMsg}`, 'error');
         await this.delay(5000); // Wait longer on error
       }
     }
@@ -145,26 +154,23 @@ export class Bot {
       // Calculate net profit
       const profitCalc = this.calculator.calculateNetProfitOpportunity(opportunity, positionSize);
       
-      console.log(`\n💰 Evaluating trade opportunity:`);
+      console.log(`Evaluating trade opportunity:`);
       console.log(`   Pair: ${opportunity.pair}`);
       console.log(`   Buy: ${opportunity.buyDex} | Sell: ${opportunity.sellDex}`);
       console.log(`   Position: ${positionSize.toFixed(4)} SOL`);
-      console.log(`   Gross Profit: ${profitCalc.grossProfit.toFixed(6)} SOL (${opportunity.profitPct.toFixed(3)}%)`);
-      console.log(`   Fees: ${profitCalc.fees.toFixed(6)} SOL`);
-      console.log(`   Slippage: ${profitCalc.slippageCost.toFixed(6)} SOL`);
       console.log(`   Net Profit: ${profitCalc.netProfit.toFixed(6)} SOL (${profitCalc.netProfitPct.toFixed(3)}%)`);
 
       // Only execute if profitable
       if (!profitCalc.isProfitable) {
-        console.log(`   ⏭️ Skipping - not profitable enough`);
+        console.log(`   Skipping - not profitable enough`);
         this.pairManager.completeCurrentPair(false);
         this.isTrading = false;
         return;
       }
 
       // Execute the trade via Jito
-      console.log(`\n🔵 Executing arbitrage trade...`);
-      await this.alerts.notifyTrade(true, opportunity.pair, positionSize, 0);
+      console.log(`Executing arbitrage trade...`);
+      await this.sendTradeAlerts(true, opportunity.pair, positionSize, 0);
 
       // TODO: Build and execute actual swap transactions
       // This would involve:
@@ -178,10 +184,10 @@ export class Bot {
 
       if (success) {
         const actualProfit = profitCalc.netProfit;
-        console.log(`   ✅ Trade successful! Profit: ${actualProfit.toFixed(6)} SOL`);
+        console.log(`   Trade successful! Profit: ${actualProfit.toFixed(6)} SOL`);
         
-        await this.alerts.notifyTrade(false, opportunity.pair, positionSize, 0);
-        await this.alerts.notifyProfit(actualProfit, profitCalc.netProfitPct);
+        await this.sendTradeAlerts(false, opportunity.pair, positionSize, 0);
+        await this.sendAllAlerts(`Profit: ${actualProfit >= 0 ? '+' : ''}${actualProfit.toFixed(6)} SOL (${profitCalc.netProfitPct.toFixed(2)}%)`, 'success');
         
         this.risk.recordTrade({
           timestamp: Date.now(),
@@ -198,7 +204,7 @@ export class Bot {
         // Cooldown after win
         await this.delay(CONFIG.execution.cooldownAfterWin);
       } else {
-        console.log(`   ❌ Trade failed`);
+        console.log(`   Trade failed`);
         
         this.risk.recordTrade({
           timestamp: Date.now(),
@@ -217,8 +223,9 @@ export class Bot {
 
     } catch (error) {
       console.error('Error executing trade:', error);
-      this.state.setError(`Trade error: ${error instanceof Error ? error.message : String(error)}`);
-      await this.alerts.notifyError(`Trade error: ${error instanceof Error ? error.message : String(error)}`);
+      const errMsg = error instanceof Error ? error.message : String(error);
+      this.state.setError(`Trade error: ${errMsg}`);
+      await this.sendAllAlerts(`Trade error: ${errMsg}`, 'error');
     } finally {
       this.isTrading = false;
     }
@@ -249,8 +256,24 @@ export class Bot {
     const summary = this.state.getSummary();
     console.log('\n' + summary);
     
-    await this.alerts.sendMessage(`🛑 <b>Bot Stopped</b>\n\n${summary}`);
+    await this.sendAllAlerts(`Bot Stopped\n\n${summary}`, 'warning');
     console.log('Bot stopped');
+  }
+
+  private async sendAllAlerts(message: string, type: 'info' | 'success' | 'warning' | 'error' = 'info'): Promise<void> {
+    await Promise.all([
+      this.telegram.sendMessage(message),
+      this.discord.sendMessage(message),
+      this.whatsapp.sendMessage(message),
+    ]);
+  }
+
+  private async sendTradeAlerts(opening: boolean, pair: string, amount: number, price: number): Promise<void> {
+    await Promise.all([
+      this.telegram.notifyTrade(opening, pair, amount, price),
+      this.discord.notifyTrade(opening, pair, amount, price),
+      this.whatsapp.notifyTrade(opening, pair, amount, price),
+    ]);
   }
 
   private delay(ms: number): Promise<void> {
