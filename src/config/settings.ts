@@ -6,8 +6,11 @@ function validateEnv() {
   if (missing.length > 0) {
     console.error('\n❌ Missing required environment variables:');
     missing.forEach((key) => console.error(`   - ${key}`));
-    console.error('\nPlease create a .env file with your credentials.');
-    console.error('See .env.example for required variables.\n');
+    console.error('\nTo get your Phantom Wallet private key:');
+    console.error('1. Open Phantom Wallet and unlock your account');
+    console.error('2. Click the 3-dot menu → Export Private Key');
+    console.error('3. Enter your password and copy the base58 key');
+    console.error('4. Paste it in your .env file: PRIVATE_KEY=your_key_here\n');
     process.exit(1);
   }
 }
